@@ -1,6 +1,6 @@
 <%namespace module='pyfr.backends.base.makoutil' name='pyfr'/>
 
-<%pyfr:macro name='inviscid_flux' params='s, f, p, v'>
+<%pyfr:macro name='inviscid_flux' params='s, f, p, v, vb'>
     fpdtype_t invrho = 1.0/s[0], E = s[${nvars - 1}];
 
     // Compute the velocities
@@ -11,7 +11,8 @@
 % endfor
 
     // Compute the pressure
-    p = ${c['gamma'] - 1}*(E - 0.5*invrho*${pyfr.dot('rhov[{i}]', i=ndims)});
+    fpdtype_t rote = 0.5*s[0]*(vb[0]*vb[0] + vb[1]*vb[1]);
+    p = ${c['gamma'] - 1}*(E - 0.5*invrho*${pyfr.dot('rhov[{i}]', i=ndims)} + rote);
 
     // Density and energy fluxes
 % for i in range(ndims):
@@ -21,7 +22,7 @@
 
     // Momentum fluxes
 % for i, j in pyfr.ndrange(ndims, ndims):
-    f[${i}][${j + 1}] = rhov[${i}]*v[${j}]${' + p' if i == j else ''};
+    f[${i}][${j + 1}] = rhov[${j}]*v[${i}]${' + p' if i == j else ''};
 % endfor
 </%pyfr:macro>
 

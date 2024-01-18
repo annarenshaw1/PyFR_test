@@ -1,4 +1,6 @@
 from functools import cached_property
+import math
+import re
 
 import numpy as np
 
@@ -75,7 +77,7 @@ class BaseElements:
         self.scal_upts = np.empty((self.nupts, self.nvars, self.neles))
 
         # Convert from primitive to conservative form
-        for i, v in enumerate(self.pri_to_con(ics, self.cfg)):
+        for i, v in enumerate(self.pri_to_con(ics, self.cfg, coords=coords)):
             self.scal_upts[:, i, :] = v
 
     def set_ics_from_soln(self, solnmat, solncfg):
@@ -104,9 +106,17 @@ class BaseElements:
         return plocfpts
 
     @cached_property
-    def _scal_upts_cpy(self):
-        return self._be.matrix((self.nupts, self.nvars, self.neles),
-                               tags={'align'})
+    def vbfpts(self):
+        ploc = self.plocfpts
+        x = ploc[..., 0]
+        y = ploc[..., 1]
+        omg = self.cfg.getfloat('constants', 'omg')
+
+        vb = np.zeros_like(ploc[..., :2])
+        vb[..., 0] = -y*omg
+        vb[..., 1] =  x*omg
+
+        return vb
 
     @cached_property
     def _srtd_face_fpts(self):
@@ -151,6 +161,29 @@ class BaseElements:
         else:
             raise ValueError('Invalid slice region')
 
+    @cached_property
+    def _src_exprs(self):
+        convars = self.convarmap[self.ndims]
+
+        # Variable and function substitutions
+        subs = self.cfg.items('constants')
+        subs |= dict(x='ploc[0]', y='ploc[1]', z='ploc[2]')
+        subs |= dict(abs='fabs', pi=math.pi)
+        subs |= {v: f'u[{i}]' for i, v in enumerate(convars)}
+
+        return [self.cfg.getexpr('solver-source-terms', v, '0', subs=subs)
+                for v in convars]
+
+    @cached_property
+    def _ploc_in_src_exprs(self):
+        return any(re.search(r'\bploc\b', ex) for ex in self._src_exprs)
+
+    @cached_property
+    def _soln_in_src_exprs(self):
+        c1 = self.cfg.getfloat('constants', 'omg') != 0
+        c2 = any(re.search(r'\bu\b', ex) for ex in self._src_exprs)
+        return c1 or c2
+
     def set_backend(self, backend, nscalupts, nonce, linoff):
         self._be = backend
 
@@ -176,6 +209,10 @@ class BaseElements:
             self._scal_fpts = salloc('scal_fpts', nfpts)
         if 'scal_qpts' in sbufs:
             self._scal_qpts = salloc('scal_qpts', nqpts)
+
+        # Allocate additional scalar scratch space
+        if 'scal_upts_cpy' in sbufs:
+            self._scal_upts_cpy = salloc('scal_upts_cpy', nupts)
 
         # Allocate required vector scratch space
         if 'vect_upts' in sbufs:
@@ -220,8 +257,7 @@ class BaseElements:
         smats_mpts, _ = self._smats_djacs_mpts
 
         # Interpolation matrix to pts
-        pt = getattr(self.basis, name) if isinstance(name, str) else name
-        m0 = self.basis.mbasis.nodal_basis_at(pt)
+        m0 = self.basis.mbasis.nodal_basis_at(getattr(self.basis, name))
 
         # Interpolate the smats
         smats = np.array([m0 @ smat for smat in smats_mpts])
@@ -259,7 +295,7 @@ class BaseElements:
         op = self.basis.sbasis.nodal_basis_at(pt)
 
         ploc = op @ self.eles.reshape(self.nspts, -1)
-        ploc = ploc.reshape(len(pt), -1, self.ndims).swapaxes(1, 2)
+        ploc = ploc.reshape(-1, self.neles, self.ndims).swapaxes(1, 2)
 
         return ploc
 
@@ -267,6 +303,24 @@ class BaseElements:
     @memoize
     def ploc_at(self, name):
         return self._be.const_matrix(self.ploc_at_np(name), tags={'align'})
+
+    @memoize
+    def vb_at_np(self, name):
+        ploc = self.ploc_at_np(name)
+        x = ploc[:, 0, :]
+        y = ploc[:, 1, :]
+        omg = self.cfg.getfloat('constants', 'omg')
+
+        vb = np.zeros_like(ploc[:, :2, :])
+        vb[:, 0, :] = -y*omg
+        vb[:, 1, :] =  x*omg
+
+        return vb
+
+    @sliceat
+    @memoize
+    def vb_at(self, name):
+        return self._be.const_matrix(self.vb_at_np(name), tags={'align'})
 
     @cached_property
     def upts(self):
@@ -278,25 +332,21 @@ class BaseElements:
 
     @cached_property
     def _pnorm_fpts(self):
-        return self.pnorm_at('fpts', self.basis.norm_fpts)
-
-    @memoize
-    def pnorm_at(self, name, norm):
-        smats = self.smat_at_np(name).transpose(1, 3, 0, 2)
+        smats = self.smat_at_np('fpts').transpose(1, 3, 0, 2)
 
         # We need to compute |J|*[(J^{-1})^{T}.N] where J is the
-        # Jacobian and N is the normal for each point. Using
+        # Jacobian and N is the normal for each fpt.  Using
         # J^{-1} = S/|J| where S are the smats, we have S^{T}.N.
-        pnorm = np.einsum('ijlk,il->ijk', smats, norm)
+        pnorm_fpts = np.einsum('ijlk,il->ijk', smats, self.basis.norm_fpts)
 
         # Compute the magnitudes of these flux point normals
-        mag_pnorm = np.einsum('...i,...i', pnorm, pnorm)
+        mag_pnorm_fpts = np.einsum('...i,...i', pnorm_fpts, pnorm_fpts)
 
         # Check that none of these magnitudes are zero
-        if np.any(np.sqrt(mag_pnorm) < 1e-10):
+        if np.any(np.sqrt(mag_pnorm_fpts) < 1e-10):
             raise RuntimeError('Zero face normals detected')
 
-        return pnorm
+        return pnorm_fpts
 
     @cached_property
     def _smats_djacs_mpts(self):
@@ -386,3 +436,7 @@ class BaseElements:
     def get_ploc_for_inter(self, eidx, fidx):
         fpts_idx = self._srtd_face_fpts[fidx][eidx]
         return self.plocfpts[fpts_idx, eidx]
+
+    def get_vb_for_inter(self, eidx, fidx):
+        fpts_idx = self._srtd_face_fpts[fidx][eidx]
+        return self.vbfpts[fpts_idx, eidx]
